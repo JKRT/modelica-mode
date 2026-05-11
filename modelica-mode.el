@@ -1,4 +1,4 @@
-;;; modelica-mode.el (XModelica-mode)--- major mode for editing Modelica files
+;;; modelica-mode.el --- major mode for editing Modelica files -*- lexical-binding: t; -*-
 ;; Copyright (C) 2019       John Tinnerholm
 ;; Copyright (C) 2019       Free Software Foundation, Inc
 ;; Copyright (C  2019       Espen Skoglund <esk@gnu.org>
@@ -6,7 +6,7 @@
 ;; Copyright (C) 1997--2001 Ruediger Franke
 ;; Copyright (C) 1997--2001 Free Software Foundation, Inc.
 
-;; Keywords: languages, continuous system modeling
+;; Keywords: languages, tools, modelica
 ;; Author:   John Tinnerholm <jtinnerholm@gmail.com>
 
 ;; This code has been written for use with Emacs and shares its licensing.
@@ -28,24 +28,202 @@
 ;; For indention reuses many procedures for Pascal-mode provided by Espen Skoglund
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defun modelica--package-directory ()
+  "Return the directory containing modelica-mode sources."
+  (or (and load-file-name (file-name-directory load-file-name))
+      (and buffer-file-name (file-name-directory buffer-file-name))
+      default-directory))
+
+(defun modelica--ensure-parser-loaded ()
+  "Load the parser integration for modelica-mode."
+  (or (featurep 'modelica-mode_)
+      (let ((dir (modelica--package-directory)))
+        (when (and dir (file-directory-p dir))
+          (add-to-list 'load-path dir))
+        (require 'modelica-mode_ nil t))))
+
+(condition-case nil
+    (modelica--ensure-parser-loaded)
+  (error nil))
+
+(declare-function modelica-mode-clear-parse-cache "modelica-mode_" (&optional buffer))
+(declare-function modelica-mode-parse-buffer "modelica-mode_" (&optional buffer))
+
 (defconst modelica-mode-version "2.0.0")
+
+(defgroup modelica-mode nil
+  "Customization group for Modelica major mode."
+  :group 'languages
+  :prefix "modelica-")
+
+;;; Native compilation support (.eln)
+(defconst modelica--native-compilation-sources
+  '("modelica-mode.el"
+    "modelica-mode_.el"
+    "absyn-parser.el"
+    "absyn-ast.el")
+  "Modelica-mode source files compiled for native `.eln' generation.")
+
+(defvar modelica--native-compilation-triggered nil
+  "Internal flag used to avoid repeated auto native compilation.")
+
+(defconst modelica--native-compilation-cache-dir
+  (file-name-as-directory (expand-file-name "eln-cache" user-emacs-directory))
+  "Directory used for modelica-mode native `.eln' output.")
+
+(defun modelica--native-compilation-cache-dir-ready-p ()
+  "Ensure and return non-nil when the `.eln' cache directory is writable."
+  (when (and (boundp 'native-comp-eln-load-path)
+             (stringp modelica--native-compilation-cache-dir))
+    (ignore-errors
+      (make-directory modelica--native-compilation-cache-dir t)
+      (unless (member modelica--native-compilation-cache-dir
+                      native-comp-eln-load-path)
+        (setq native-comp-eln-load-path
+              (append (list modelica--native-compilation-cache-dir)
+                      native-comp-eln-load-path)))
+      (and (file-directory-p modelica--native-compilation-cache-dir)
+           (file-writable-p modelica--native-compilation-cache-dir)))))
+
+(defcustom modelica-enable-native-compilation t
+  "Enable native compilation for modelica-mode sources using `.eln'.
+When non-nil and native compilation is available, the package files are
+compiled asynchronously on first entry into modelica-mode."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defcustom modelica-native-compile-on-save nil
+  "Recompile `modelica-mode' native files after saving package sources.
+This has no effect when `modelica-enable-native-compilation' is nil."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defun modelica-native-compilation-available-p ()
+  "Return non-nil when Emacs native compilation is available for this session."
+  (and (fboundp 'native-compile)
+       (fboundp 'native-compile-async)
+       (modelica--native-compilation-cache-dir-ready-p)
+       (let ((ok nil))
+         (dolist (dir native-comp-eln-load-path ok)
+           (when (and dir
+                      (file-directory-p dir)
+                      (file-writable-p dir))
+             (setq ok t))))))
+
+(defun modelica--native-package-dir ()
+  (or (and load-file-name (file-name-directory load-file-name))
+      default-directory))
+
+(defun modelica--native-compilation-files ()
+  "Return absolute `.el' paths for modelica-mode parser+mode sources."
+  (let ((dir (modelica--native-package-dir)))
+    (delq nil
+          (mapcar (lambda (f)
+                    (let ((path (expand-file-name f dir)))
+                      (and (file-readable-p path) path)))
+                  modelica--native-compilation-sources))))
+
+(defun modelica-native-compile (&optional async)
+  "Compile modelica-mode source files to `.eln'.
+
+When ASYNC is nil (default), compiles asynchronously with
+`native-compile-async'. When ASYNC is non-nil, runs synchronous
+`native-compile'."
+  (interactive "P")
+  (unless (modelica-native-compilation-available-p)
+    (user-error "Native compilation unavailable"))
+  (let ((files (modelica--native-compilation-files))
+        (fn (if async #'native-compile #'native-compile-async)))
+    (if (null files)
+        (user-error "No modelica-mode source files found for native compilation")
+      (dolist (file files) (funcall fn file)))))
+
+(defun modelica--native-compilation-maybe ()
+  (when (and modelica-enable-native-compilation
+             (not modelica--native-compilation-triggered)
+             (modelica-native-compilation-available-p))
+    (setq modelica--native-compilation-triggered t)
+    (ignore-errors (modelica-native-compile))))
+
+(defun modelica--native-compilation-after-save ()
+  (when (and modelica-enable-native-compilation
+             modelica-native-compile-on-save
+             buffer-file-name
+             (not (file-remote-p buffer-file-name)))
+    (let ((file (file-truename buffer-file-name))
+          (files (mapcar #'file-truename (modelica--native-compilation-files))))
+      (when (member file files)
+        (modelica-native-compile)))))
+
 ;;; History
 ;;    see ChangeLog
 ;;; constants
-(setq modelica-indent-level       2
-      modelica-case-indent        2
-      modelica-auto-newline       nil
-      modelica-tab-always-indent  t
-      modelica-auto-endcomments   t
-      modelica-auto-lineup        '(all)
-      modelica-type-keywords      '("array" "String" "Boolean"
-                                    "Integer" "Real" "string" "record" "uniontype")
-      modelica-start-keywords     '("algorithm" "equation" "function" "end"
-                                    "connector" "block" "while" "for" "initial equation"
-                                    "initial algorithm" "local"
-                                    "match" "matchcontinue"
-                                    "reset" "print")
-      modelica-separator-keywords '("else" "then"))
+(defcustom modelica-indent-level 2
+  "Indentation depth for block bodies."
+  :type 'integer
+  :safe #'integerp
+  :group 'modelica-mode)
+
+(defcustom modelica-case-indent 2
+  "Indentation depth for case statement bodies."
+  :type 'integer
+  :safe #'integerp
+  :group 'modelica-mode)
+
+(defcustom modelica-auto-newline nil
+  "Whether to insert a newline after semicolons in specific contexts."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defcustom modelica-tab-always-indent t
+  "Whether `TAB' should always reindent the current line."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defcustom modelica-auto-endcomments t
+  "Whether to insert block end comments for certain block endings."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defcustom modelica-auto-lineup '(all)
+  "Contexts where alignment of declarations is done automatically."
+  :type '(repeat symbol)
+  :safe #'listp
+  :group 'modelica-mode)
+
+(defcustom modelica-indent-nested-classes t
+  "Whether nested classes are additionally indented."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'modelica-mode)
+
+(defcustom modelica-type-keywords
+  '("array" "String" "Boolean" "Integer" "Real" "string" "record" "uniontype")
+  "Modelica type keywords used by completion and editing helpers."
+  :type '(repeat string)
+  :safe #'listp
+  :group 'modelica-mode)
+
+(defcustom modelica-start-keywords
+  '("algorithm" "equation" "function" "end" "connector" "block" "while" "for"
+    "initial equation" "initial algorithm" "local" "match" "matchcontinue" "reset"
+    "print")
+  "Modelica keywords typically used to start statements."
+  :type '(repeat string)
+  :safe #'listp
+  :group 'modelica-mode)
+
+(defcustom modelica-separator-keywords
+  '("else" "then")
+  "Modelica separator keywords used by completion."
+  :type '(repeat string)
+  :safe #'listp
+  :group 'modelica-mode)
 
 
 (defconst modelica-class-modifier-keyword
@@ -73,14 +251,14 @@
 ;;For completion help
 (defconst modelica-symbol-re      "\\<[a-zA-Z_][a-zA-Z_0-9.]*\\>")
 ;Things that starts blocks
-(defconst modelica-beg-block-re   "\\<\\(\\|model\\|connector\\|record\\|uniontype\\||algorithm\\|equation\\|case\\|record\\|uniontype\\|local\\|function\\|match\\|matchcontinue\\connector\\|class\\|block\\)\\>")
+(defconst modelica-beg-block-re   "\\<\\(algorithm\\|case\\|connector\\|equation\\|function\\|class\\|local\\|match\\|matchcontinue\\|model\\|record\\|uniontype\\|block\\)\\>")
 (defconst modelica-end-block-re   "\\<\\(end\\)\\>")
-;;Should not be indented 
+;;Should not be indented
 (defconst modelica-declaration-re "\\<\\(constant\\|connector\\|class\\|block\\)\\>")
 ;;Packages are special
 (defconst modelica-progbeg-re     "\\<package\\>")
 ;;Treat functions in their own way :)
-(defconst modelica-defun-re       "\\<\\(function\\|class\\package|\\uniontype|record\\block|connector\\)\\>")
+(defconst modelica-defun-re       "\\<\\(function\\|class\\|package\\|uniontype\\|record\\|block\\|connector\\)\\>")
 ;;Things to treat as subblocks
 (defconst modelica-sub-block-re   "\\<\\(if\\|else\\|for\\|while\\|when\\|case\\)\\>")
 ;;Things that shall have no extra indention. algorithm,  equation initial
@@ -91,85 +269,59 @@
 (defconst modelica-autoindent-lines-re "\\<\\(import\\)\\>")
 
 ;;; Interface to font-lock
-(defvar modelica-font-lock-keywords nil
+(defvar modelica-font-lock-keywords
+  (list
+   (list (concat "\\<"
+                 (regexp-opt
+                  '("import" "within" "extends"
+                    "for" "while" "in" "loop" "when"
+                    "if" "then" "else" "elseif" "elsewhen"
+                    "and" "not" "or" "case"))"\\>")
+         0 'font-lock-keyword-face)
+   (list (concat "\\<"
+                 (regexp-opt
+                  '("algorithm" "equation" "public" "protected" "match" "matchcontinue" "local" "guard" "as") t)
+                 "\\>")
+         0 'font-lock-keyword-face)
+   (list (concat "\\<"
+                 (regexp-opt
+                  '("redeclare" "final" "partial" "replaceable"
+                    "inner" "outer" "encapsulated"
+                    "discrete" "parameter" "constant"
+                    "flow" "input" "output" "external"
+                    "block" "class" "connector" "function" "model"
+                    "package" "record" "type"
+                    "end" "uniontype") t) "\\>")
+         0 'font-lock-type-face)
+   (list (concat "\\<"
+                 "\\(a\\(bs\\|nalysisType\\)\\|c\\(ardinality\\|eil\\|"
+                 "hange\\|ross\\)\\|d\\(e\\(lay\\|r\\)\\|i\\(agonal\\|"
+                 "v\\)\\)\\|edge\\|f\\(ill\\|loor\\)\\|i\\(dentity\\|"
+                 "n\\(itial\\|teger\\)\\)\\|linspace\\|m\\(a\\(trix\\|"
+                 "x\\)\\|in\\|od\\)\\|n\\(dims\\|oEvent\\)\\|o\\(nes\\|"
+                 "uterProduct\\)\\|pr\\(e\\|o\\(duct\\|mote\\)\\)\\|"
+                 "re\\(init\\|m\\)\\|s\\(amle\\|calar\\|i\\(gn\\|"
+                 "ze\\)\\|kew\\|qrt\\|um\\|ymmetric\\)\\|t\\(erminal\\|"
+                 "ranspose\\)\\|vector\\|zeros\\)"
+                 "\\>")
+         0 'font-lock-function-name-face)
+   (list (concat "\\<"
+                 "\\(assert\\|terminate\\)"
+                 "\\>")
+         0 'font-lock-warning-face)
+   (list (concat "\\<"
+                 "\\(annotation\\|connect\\)"
+                 "\\>")
+         0 'font-lock-builtin-face)
+   (list (concat "\\<"
+                 "\\(false\\|true\\)"
+                 "\\>")
+         0)
+   (list (concat "\\<"
+                 "\\(time\\)"
+                 "\\>")
+         0 'font-lock-variable-name-face))
   "Keywords to highlight for Modelica. See variable `font-lock-keywords'.")
-
-(if modelica-font-lock-keywords
-    ()
-  (setq modelica-font-lock-keywords
-	(list
-	 (list (concat "\\<"
-                       (regexp-opt
-                        '("import" "within" "extends"
-                          "for" "while" "in" "loop" "when"
-                          "if" "then" "else" "elseif" "elsewhen"
-                          "and" "not" "or" "case"))"\\>")
-               0 'font-lock-keyword-face)
-	 (list (concat "\\<"
-                       (regexp-opt
-                        '("algorithm" "equation" "public" "protected" "match" "matchcontinue" "local" "guard" "as") t)
-                       "\\>")
-               0 'font-lock-keyword-face)
-	 (list (concat "\\<"
-                       (regexp-opt
-                        '("redeclare" "final" "partial" "replaceable"
-                          "inner" "outer" "encapsulated"
-                          "discrete" "parameter" "constant"
-                          "flow" "input" "output" "external"
-                          "block" "class" "connector" "function" "model"
-                          "package" "record" "type"
-                          "end" "uniontype") t) "\\>")
-               0 'font-lock-type-face)
-	 (list (concat "\\<"
-                                        ;(regexp-opt
-                                        ; '("der" "analysisType" "initial" "terminal"
-                                        ;   "noEvent" "samle" "pre" "edge" "change"
-                                        ;   "reinit" "abs" "sign" "sqrt" "div" "mod"
-                                        ;   "rem" "ceil" "floor" "integer" "delay"
-                                        ;   "cardinality"
-                                        ;   "promote" "ndims" "size" "scalar" "vector" "matrix"
-                                        ;   "transpose" "outerProduct" "identity" "diagonal"
-                                        ;   "zeros" "ones" "fill" "linspace" "min" "max" "sum"
-                                        ;   "product" "symmetric" "cross" "skew"
-                                        ;) t)
-                       "\\(a\\(bs\\|nalysisType\\)\\|c\\(ardinality\\|eil\\|"
-                       "hange\\|ross\\)\\|d\\(e\\(lay\\|r\\)\\|i\\(agonal\\|"
-                       "v\\)\\)\\|edge\\|f\\(ill\\|loor\\)\\|i\\(dentity\\|"
-                       "n\\(itial\\|teger\\)\\)\\|linspace\\|m\\(a\\(trix\\|"
-                       "x\\)\\|in\\|od\\)\\|n\\(dims\\|oEvent\\)\\|o\\(nes\\|"
-                       "uterProduct\\)\\|pr\\(e\\|o\\(duct\\|mote\\)\\)\\|"
-                       "re\\(init\\|m\\)\\|s\\(amle\\|calar\\|i\\(gn\\|"
-                       "ze\\)\\|kew\\|qrt\\|um\\|ymmetric\\)\\|t\\(erminal\\|"
-                       "ranspose\\)\\|vector\\|zeros\\)"
-                       "\\>")
-               0 'font-lock-function-name-face)
-	 (list (concat "\\<"
-                                        ;(regexp-opt
-                                        ; '("assert" "terminate") t)
-                       "\\(assert\\|terminate\\)"
-                       "\\>")
-               0 'font-lock-warning-face)
-	 (list (concat "\\<"
-                                        ;(regexp-opt
-                                        ; '("annotation" "connect") t)
-                       "\\(annotation\\|connect\\)"
-                       "\\>")
-               0 (if (string-match "XEmacs" (emacs-version))
-                     ;; XEmacs 21.1 still uses old font-lock version
-                     (identity 'font-lock-preprocessor-face)
-		   (identity 'font-lock-builtin-face)))
-	 (list (concat "\\<"
-                                        ;(regexp-opt
-                                        ; '("false" "true") t)
-                       "\\(false\\|true\\)"
-                       "\\>")
-               0 )
-	 (list (concat "\\<"
-                                        ;(regexp-opt
-                                        ; '("time") t)
-                       "\\(time\\)"
-                       "\\>")
-               0 'font-lock-variable-name-face)))
 
 ;;; The mode
   (defvar modelica-basic-offset 2
@@ -184,6 +336,11 @@
     "Abbrev table used while in Modelica mode.")
   (define-abbrev-table 'modelica-mode-abbrev-table ())
 
+  (declare-function modelica-last-unended-begin "modelica-mode" (&optional arg))
+  (declare-function modelica-within-comment "modelica-mode" (&optional arg))
+  (declare-function modelica-within-matrix-expression "modelica-mode" (&optional arg))
+  (declare-function modelica-within-equation "modelica-mode" (&optional arg))
+  (declare-function mdc-forward-begin "modelica-mode" ())
 
   (defun modelica-statement-start (&optional ref-point)
     "Move point to the first character of the current statement;
@@ -234,19 +391,15 @@
        (t
         (forward-word 1)))
       (forward-comment (buffer-size))))
- 
-  (if modelica-mode-syntax-table
-      ()              ; Do not change the table if it is already set up.
+
+  (unless modelica-mode-syntax-table
     (setq modelica-mode-syntax-table (make-syntax-table))
 
     (modify-syntax-entry ?_ "w"       modelica-mode-syntax-table)
     (modify-syntax-entry ?. "w"       modelica-mode-syntax-table)
-    (if (string-match "XEmacs" (emacs-version))
-        (modify-syntax-entry ?/  ". 1456" modelica-mode-syntax-table)
-      (modify-syntax-entry ?/  ". 124b" modelica-mode-syntax-table))
-
-    (modify-syntax-entry ?*  ". 23"   modelica-mode-syntax-table)
-    (modify-syntax-entry ?\n "> b"    modelica-mode-syntax-table))
+    (modify-syntax-entry ?/  ". 124b"  modelica-mode-syntax-table)
+    (modify-syntax-entry ?*  ". 23"    modelica-mode-syntax-table)
+    (modify-syntax-entry ?\n "> b"     modelica-mode-syntax-table))
 
 
 ;;;
@@ -257,7 +410,7 @@
       (while (and (> nest 0)
                   (re-search-forward
                    "[:=]\\|\\(\\<record\\>\\)\\|\\(\\<end\\>\\)"
-                   (point-at-eol 2) t))
+                   (line-end-position 2) t))
         (cond ((match-beginning 1) (setq nest (1+ nest)))
               ((match-beginning 2) (setq nest (1- nest)))
               ((looking-at "[^(\n]+)") (setq nest 0))))))
@@ -266,28 +419,29 @@
   (defun modelica-declaration-beg ()
     (let ((nest 1))
       (while (and (> nest 0)
-                  (re-search-backward "[:=]\\|\\<\\(type\\|var\\|label\\|const\\)\\>\\|\\(\\<record\\>\\)\\|\\(\\<end\\>\\)" (point-at-bol 0) t))
+                  (re-search-backward "[:=]\\|\\<\\(type\\|var\\|label\\|const\\)\\>\\|\\(\\<record\\>\\)\\|\\(\\<end\\>\\)" (line-beginning-position) t))
         (cond ((match-beginning 1) (setq nest 0))
               ((match-beginning 2) (setq nest (1- nest)))
               ((match-beginning 3) (setq nest (1+ nest)))))
       (= nest 0)))
 
 
-  (defsubst modelica-within-string ()
-    (nth 3 (parse-partial-sexp (point-at-bol) (point))))
+(defun modelica-within-string ()
+  (nth 3 (parse-partial-sexp (line-beginning-position) (point))))
 
 
 ;;;###autoload
   (define-derived-mode modelica-mode prog-mode "Modelica"
     "Major mode for editing Modelica code.\\<modelica-mode-map>
-TAB indents for Modelica code.  Delete converts tabs to spaces as it moves back.
+TAB indents for Modelica code.
+Delete converts tabs to spaces as it moves back.
 \\[completion-at-point] completes the word around current point with respect \
 to position in code
 \\[completion-help-at-point] shows all possible completions at this point.
 Other useful functions are:
 \\[modelica-mark-defun]\t- Mark function.
 \\[modelica-star-comment]\t- insert (* ... *)
-\\[modelica-comment-area]\t- Put marked area in a comment, fixing nested comments.
+\\[modelica-comment-area]\t- Comment marked area.
 \\[modelica-uncomment-area]\t- Uncomment an area commented with \
 \\[modelica-comment-area].
 \\[modelica-beg-of-defun]\t- Move to beginning of current function.
@@ -312,8 +466,8 @@ Variables controlling indentation/edit style:
     functions. The name of the function or case will be set between the braces.
  `modelica-auto-lineup' (default t)
     List of contexts where auto lineup of :'s or ='s should be done.
-See also the user variables `modelica-type-keywords', `modelica-start-keywords' and
-`modelica-separator-keywords'."
+See also `modelica-type-keywords', `modelica-start-keywords',
+and `modelica-separator-keywords'."
 
     `;;For comments
   (make-local-variable 'comment-column)
@@ -327,17 +481,21 @@ See also the user variables `modelica-type-keywords', `modelica-start-keywords' 
    comment-start-skip "//*"
    comment-end ""
    comment-multi-line nil)
-  
 
-    (setq-local local-abbrev-table modelica-mode-abbrev-table)
-    (setq-local indent-line-function 'modelica-indent-line)
-    (setq-local comment-indent-function 'modelica-indent-comment)
-    (setq-local parse-sexp-ignore-comments nil)
-    (setq-local blink-matching-paren-dont-ignore-comments t)
-    (setq-local case-fold-search t)
-    (add-hook 'completion-at-point-functions 'modelica-completions-at-point nil t)
-    ;; Font lock support
-    (setq-local font-lock-defaults '(modelica-font-lock-keywords nil nil))
+
+  (setq-local local-abbrev-table modelica-mode-abbrev-table)
+  (setq-local indent-line-function 'modelica-indent-line)
+  (setq-local comment-indent-function 'modelica-indent-comment)
+  (setq-local parse-sexp-ignore-comments nil)
+  (setq-local blink-matching-paren-dont-ignore-comments t)
+  (setq-local case-fold-search t)
+  (setq-local line-move-ignore-invisible t)
+  (modelica--native-compilation-maybe)
+  (when modelica-native-compile-on-save
+    (add-hook 'after-save-hook #'modelica--native-compilation-after-save nil t))
+  (add-hook 'completion-at-point-functions 'modelica-completions-at-point nil t)
+  ;; Font lock support
+  (setq-local font-lock-defaults '(modelica-font-lock-keywords nil nil))
     (setq-local imenu-case-fold-search t)
     ;; Modelica-mode's own hide/show support.
     (add-to-invisibility-spec '(modelica . t)))
@@ -368,7 +526,7 @@ See also the user variables `modelica-type-keywords', `modelica-start-keywords' 
                (forward-char 1)
                (delete-horizontal-space))
               ((and (looking-at "(\\*\\|\\*[^)]")
-                    (not (save-excursion (search-forward "*)" (point-at-eol) t))))
+                    (not (save-excursion (search-forward "*)" (line-end-position) t))))
                (setq setstar t))))
       ;; If last line was a star comment line then this one shall be too.
       (if (null setstar)
@@ -471,9 +629,66 @@ This puts the mark at the end, and point at the beginning."
     (push-mark)
     (modelica-beg-of-defun))
 
-  (defun modelica-comment-area (start end))
+  (defun modelica-comment-area (start end)
+    "Comment region from START to END."
+    (interactive "r")
+    (comment-region start end))
 
-  (defun modelica-uncomment-area ())
+  (defun modelica-uncomment-area (start end)
+    "Uncomment region from START to END."
+    (interactive "r")
+    (comment-region start end '(4)))
+
+  (defun modelica-newline-and-indent ()
+    "Insert a newline and reindent according to Modelica mode."
+    (interactive)
+    (electric-modelica-terminate-line))
+
+  (defun modelica-insert-end ()
+    "Insert `end` at point."
+    (interactive)
+    (insert "end")
+    (modelica-indent-line))
+
+  (defun modelica-indent-for-comment ()
+    "Indent the current comment using `comment-indent'."
+    (interactive)
+    (comment-indent))
+
+  (defun modelica-indent-new-comment-line ()
+    "Insert a correctly indented comment continuation line."
+    (interactive)
+    (comment-indent-new-line))
+
+  (defun modelica-forward-statement ()
+    "Move forward to the end of the current statement."
+    (interactive)
+    (modelica-end-of-statement))
+
+  (defun modelica-backward-statement ()
+    "Move backward to the beginning of the current statement."
+    (interactive)
+    (modelica-statement-start))
+
+  (defun modelica-forward-block ()
+    "Move forward to the end of the current block."
+    (interactive)
+    (modelica-end-of-defun))
+
+  (defun modelica-backward-block ()
+    "Move backward to the start of the current block."
+    (interactive)
+    (modelica-beg-of-defun))
+
+  (defun modelica-to-block-begin ()
+    "Move to block beginning."
+    (interactive)
+    (modelica-backward-block))
+
+  (defun modelica-to-block-end ()
+    "Move to block end."
+    (interactive)
+    (modelica-forward-block))
 
   (defun modelica-beg-of-defun ()
     "Move backward to the beginning of the current function or procedure."
@@ -520,9 +735,9 @@ This puts the mark at the end, and point at the beginning."
       (while (and (/= func 0)
                   (re-search-forward reg nil 'move))
         (cond ((let ((state (save-excursion
-			      (parse-partial-sexp (point-min) (point)))))
-		 (or (nth 3 state) (nth 4 state))) ; Inside string or comment
-	       ())
+                              (parse-partial-sexp (point-min) (point)))))
+                 (or (nth 3 state) (nth 4 state))) ; Inside string or comment
+               ())
               ((match-end 1)
                (setq nest (1+ nest))
                (if (save-excursion
@@ -597,8 +812,8 @@ This puts the mark at the end, and point at the beginning."
                                 (mapconcat 'identity modelica-keywords "\\|")
                                 "\\)\\>")))
         (goto-char (point-min))
-        (while (re-search-forward keyword-re nil t)
-          (funcall change-word -1))))))
+          (while (re-search-forward keyword-re nil t)
+            (funcall change-word -1)))))
 
 ;;;
 ;;; Indentation
@@ -613,52 +828,104 @@ This puts the mark at the end, and point at the beginning."
     (defun . modelica--extra-indent) (contexp . modelica--extra-indent)
     (unknown . modelica--extra-indent) (string . 0) (progbeg . 0)))
 
+(defun modelica--indent-line-text ()
+  "Return current line text without leading or trailing whitespace."
+  (string-trim
+   (buffer-substring-no-properties (line-beginning-position)
+                                   (line-end-position))))
+
+(defun modelica--indent-line-kind (line)
+  "Return the syntactic indentation kind for LINE."
+  (cond
+   ((string-match-p "\\`\\(model\\|class\\|package\\|function\\|block\\|connector\\|record\\|uniontype\\)\\b" line)
+    'class)
+   ((string-match-p "\\`\\(equation\\|algorithm\\|initial[ \t]+equation\\|initial[ \t]+algorithm\\)\\b" line)
+    'section)
+   ((string-match-p "\\`\\(if\\|for\\|while\\|when\\)\\b.*\\b\\(then\\|loop\\)\\b" line)
+    'control)
+   ((string-match-p "\\`end\\b" line)
+    'end)
+   ((string-match-p "\\bmatch\\(continue\\)?\\b" line)
+    'match)
+   ((string-match-p "\\`case\\b" line)
+    'case)
+   ((string-match-p "\\`else\\(if\\)?\\b" line)
+    'else)
+   (t 'statement)))
+
+(defun modelica--indent-top-kind (stack)
+  (caar stack))
+
+(defun modelica--indent-top-base (stack)
+  (cdar stack))
+
+(defun modelica--indent-compute-column ()
+  "Return parser-style indentation column for the current line."
+  (or (and (fboundp 'modelica-mode-parser-indent-column)
+           (modelica-mode-parser-indent-column (point) modelica-indent-level))
+      (save-excursion
+        (let ((target (line-beginning-position))
+              (indent 0)
+              stack)
+          (goto-char (point-min))
+          (while (< (line-beginning-position) target)
+            (let* ((line (modelica--indent-line-text))
+                   (kind (modelica--indent-line-kind line)))
+              (unless (or (string-empty-p line)
+                          (string-prefix-p "//" line))
+                (pcase kind
+                  ('class
+                   (push (cons 'class indent) stack)
+                   (setq indent (+ indent modelica-indent-level)))
+                  ('section
+                   (setq indent (+ (or (modelica--indent-top-base stack) 0)
+                                   modelica-indent-level)))
+                  ('control
+                   (push (cons 'control indent) stack)
+                   (setq indent (+ indent modelica-indent-level)))
+                  ('match
+                   (push (cons 'match indent) stack)
+                   (setq indent (+ indent modelica-indent-level)))
+                  ('end
+                   (when stack
+                     (setq indent (modelica--indent-top-base stack))
+                     (pop stack))))))
+            (forward-line 1))
+          (let* ((line (modelica--indent-line-text))
+                 (kind (modelica--indent-line-kind line)))
+            (pcase kind
+              ('section (or (modelica--indent-top-base stack) 0))
+              ('end (if stack (modelica--indent-top-base stack) 0))
+              ('else (if (eq (modelica--indent-top-kind stack) 'match)
+                         indent
+                       (max 0 (- indent modelica-indent-level))))
+              (_ indent)))))))
+
 (defun modelica-indent-command ()
   "Indent for special part of code."
   (let* ((indent-str (modelica-calculate-indent))
-	 (type (car indent-str)))
+         (type (car indent-str)))
     (cond ((and (eq type 'paramlist)
-		(or (memq 'all modelica-auto-lineup)
-		    (memq 'paramlist modelica-auto-lineup)))
-	   (modelica-indent-paramlist)
-	   (modelica-indent-paramlist))
-	  ((and (eq type 'declaration)
-		(or (memq 'all modelica-auto-lineup)
-		    (memq 'declaration  modelica-auto-lineup)))
-	   (modelica-indent-declaration))
-	  ((and (eq type 'case) (not (looking-at "^[ \t]*$"))
-		(or (memq 'all modelica-auto-lineup)
-		    (memq 'case modelica-auto-lineup)))
-	   (modelica-indent-case)))
+                (or (memq 'all modelica-auto-lineup)
+                    (memq 'paramlist modelica-auto-lineup)))
+           (modelica-indent-paramlist)
+           (modelica-indent-paramlist))
+          ((and (eq type 'declaration)
+                (or (memq 'all modelica-auto-lineup)
+                    (memq 'declaration  modelica-auto-lineup)))
+           (modelica-indent-declaration))
+          ((and (eq type 'case) (not (looking-at "^[ \t]*$"))
+                (or (memq 'all modelica-auto-lineup)
+                    (memq 'case modelica-auto-lineup)))
+           (modelica-indent-case)))
     (if (looking-at "[ \t]+$")
-	(skip-chars-forward " \t"))))
+        (skip-chars-forward " \t"))))
 
 (defun modelica-indent-line ()
   "Indent current line as a Modelica statement."
-  (let* ((indent-str (modelica-calculate-indent))
-	 (type (car indent-str))
-	 (modelica--extra-indent (car (cdr indent-str))))
-    ;; Labels should not be indented.
-    (if (and (looking-at "^[0-9a-zA-Z]+[ \t]*:[^=]")
-	     (not (eq type 'declaration)))
-	(search-forward ":" nil t))
+  (let ((indent (modelica--indent-compute-column)))
     (delete-horizontal-space)
-    (cond (; Some things should not be indented
-	   (or (and (eq type 'declaration) (looking-at modelica-declaration-re))
-	       (eq type 'cpp))
-	   ())
-	  (; Other things should have no extra indent
-	   (looking-at modelica-noindent-re)
-	   (indent-to modelica--extra-indent))
-	  (; Nested functions should be indented
-	   (looking-at modelica-defun-re)
-	   (if (and modelica-indent-nested-classes
-		    (eq type 'defun))
-	       (indent-to (+ modelica--extra-indent modelica-indent-level))
-	     (indent-to modelica--extra-indent)))
-	  (; But most lines are treated this way
-	   (indent-to (eval (cdr (assoc type modelica-indent-alist))))
-	   ))))
+    (indent-to indent)))
 
 (defun modelica-calculate-indent ()
   "Calculate the indent of the current Modelica line.
@@ -762,8 +1029,8 @@ Return a list of two elements: (INDENT-TYPE INDENT-LEVEL)."
 			    (setq complete t))
 			   )))))
 
-      ;; Return type of block and indent level.
-      (if (> par 0)                               ; Unclosed Parenthesis
+    ;; Return type of block and indent level.
+    (if (> par 0)                               ; Unclosed Parenthesis
 	  (list 'contexp par)
 	(list type (modelica-indent-level))))))
 
@@ -773,9 +1040,9 @@ Do not count labels, case statements or records."
   (save-excursion
     (beginning-of-line)
     (if (looking-at "[ \t]*[0-9a-zA-Z]+[ \t]*:[^=]")
-	(search-forward ":" nil t)
+        (search-forward ":" nil t)
       (if (looking-at ".*=[ \t]*record\\>")
-	  (search-forward "=" nil t)))
+          (search-forward "=" nil t)))
     (skip-chars-forward " \t")
     (current-column)))
 
@@ -784,43 +1051,43 @@ Do not count labels, case statements or records."
   (save-excursion
     (re-search-backward "\\((\\*\\)\\|{" nil t)
     (if (match-beginning 1)
-	(1+ (current-column))
+        (1+ (current-column))
       (current-column))))
 
 (defun modelica-indent-case ()
   "Indent within case statements."
   (let ((savepos (point-marker))
-	(end (prog2
-		 (end-of-line)
-		 (point-marker)
-	       (re-search-backward "\\<case\\>" nil t)))
-	(beg (point))
-	(modelica--extra-indent 0))
+        (end (prog2
+                 (end-of-line)
+                 (point-marker)
+               (re-search-backward "\\<case\\>" nil t)))
+        (beg (point))
+        (modelica--extra-indent 0))
     ;; Get right indent
     (while (< (point) end)
       (if (re-search-forward
-	   "^[ \t]*[^ \t,:]+[ \t]*\\(,[ \t]*[^ \t,:]+[ \t]*\\)*:"
-	   (marker-position end) 'move)
-	  (forward-char -1))
+           "^[ \t]*[^ \t,:]+[ \t]*\\(,[ \t]*[^ \t,:]+[ \t]*\\)*:"
+           (marker-position end) 'move)
+          (forward-char -1))
       (if (< (point) end)
-	  (progn
-	    (delete-horizontal-space)
-	    (if (> (current-column) modelica--extra-indent)
-		(setq modelica--extra-indent (current-column)))
-	    (modelica-end-of-statement))))
+          (progn
+            (delete-horizontal-space)
+            (if (> (current-column) modelica--extra-indent)
+                (setq modelica--extra-indent (current-column)))
+            (modelica-end-of-statement))))
     (goto-char beg)
     ;; Indent all case statements
     (while (< (point) end)
       (if (re-search-forward
-	   "^[ \t]*[^][ \t,\\.:]+[ \t]*\\(,[ \t]*[^ \t,:]+[ \t]*\\)*:"
-	   (marker-position end) 'move)
-	  (forward-char -1))
+           "^[ \t]*[^][ \t,\\.:]+[ \t]*\\(,[ \t]*[^ \t,:]+[ \t]*\\)*:"
+           (marker-position end) 'move)
+          (forward-char -1))
       (indent-to (1+ modelica--extra-indent))
       (if (/= (following-char) ?:)
-	  ()
-	(forward-char 1)
-	(delete-horizontal-space)
-	(insert " "))
+          ()
+        (forward-char 1)
+        (delete-horizontal-space)
+        (insert " "))
       (modelica-end-of-statement))
     (goto-char savepos)))
 
@@ -830,69 +1097,69 @@ If optional ARG is non-nil, just return the
 indent of the current line in parameterlist."
   (save-excursion
     (let* ((oldpos (point))
-	   (stpos (progn (goto-char (scan-lists (point) -1 1)) (point)))
-	   (stcol (1+ (current-column)))
-	   (edpos (progn (modelica-declaration-end)
-			 (search-backward ")" (point-at-bol) t)
-			 (point)))
-	   (usevar (re-search-backward "\\<var\\>" stpos t)))
+           (stpos (progn (goto-char (scan-lists (point) -1 1)) (point)))
+           (stcol (1+ (current-column)))
+           (edpos (progn (modelica-declaration-end)
+                         (search-backward ")" (line-beginning-position) t)
+                         (point)))
+           (usevar (re-search-backward "\\<var\\>" stpos t)))
       (if arg (progn
-		;; If arg, just return indent
-		(goto-char oldpos)
-		(beginning-of-line)
-		(if (or (not usevar) (looking-at "[ \t]*var\\>"))
-		    stcol (+ 4 stcol)))
-	(goto-char stpos)
-	(forward-char 1)
-	(delete-horizontal-space)
-	(if (and usevar (not (looking-at "var\\>")))
-	    (indent-to (+ 4 stcol)))
-	(modelica-indent-declaration nil stpos edpos)))))
+                ;; If arg, just return indent
+                (goto-char oldpos)
+                (beginning-of-line)
+                (if (or (not usevar) (looking-at "[ \t]*var\\>"))
+                    stcol (+ 4 stcol)))
+        (goto-char stpos)
+        (forward-char 1)
+        (delete-horizontal-space)
+        (if (and usevar (not (looking-at "var\\>")))
+            (indent-to (+ 4 stcol)))
+        (modelica-indent-declaration nil stpos edpos)))))
 
 (defun modelica-indent-declaration (&optional arg start end)
   "Indent current lines as declaration, lining up the `:'s or `='s."
   (let ((pos (point-marker)))
     (if (and (not (or arg start)) (not (modelica-declaration-beg)))
-	()
+        ()
       (let ((lineup (if (or (looking-at "\\<var\\>\\|\\<record\\>") arg start)
-			":" "="))
-	    (stpos (if start start
+                        ":" "="))
+            (stpos (if start start
                      (forward-word-strictly 2) (backward-word 1) (point)))
-	    (edpos (set-marker (make-marker)
-			       (if end end
-				 (max (progn (modelica-declaration-end)
-					     (point))
-				      pos))))
-	    modelica--extra-indent)
+            (edpos (set-marker (make-marker)
+                               (if end end
+                                 (max (progn (modelica-declaration-end)
+                                             (point))
+                                      pos))))
+            modelica--extra-indent)
 
-	(goto-char stpos)
-	;; Indent lines in record block
-	(if arg
-	    (while (<= (point) edpos)
-	      (beginning-of-line)
-	      (delete-horizontal-space)
-	      (if (looking-at "end\\>")
-		  (indent-to arg)
-		(indent-to (+ arg modelica-indent-level)))
-	      (forward-line 1)))
+        (goto-char stpos)
+        ;; Indent lines in record block
+        (if arg
+            (while (<= (point) edpos)
+              (beginning-of-line)
+              (delete-horizontal-space)
+              (if (looking-at "end\\>")
+                  (indent-to arg)
+                (indent-to (+ arg modelica-indent-level)))
+              (forward-line 1)))
 
-	;; Do lineup
-	(setq modelica--extra-indent (modelica-get-lineup-indent stpos edpos lineup))
-	(goto-char stpos)
-	(while (and (<= (point) edpos) (not (eobp)))
-	  (if (search-forward lineup (point-at-eol) 'move)
-	      (forward-char -1))
-	  (delete-horizontal-space)
-	  (indent-to modelica--extra-indent)
-	  (if (not (looking-at lineup))
-	      (forward-line 1) ; No more indent if there is no : or =
-	    (forward-char 1)
-	    (delete-horizontal-space)
-	    (insert " ")
-	    ;; Indent record block
-	    (if (looking-at "record\\>")
-		(modelica-indent-declaration (current-column)))
-	    (forward-line 1)))))
+        ;; Do lineup
+        (setq modelica--extra-indent (modelica-get-lineup-indent stpos edpos lineup))
+        (goto-char stpos)
+        (while (and (<= (point) edpos) (not (eobp)))
+          (if (search-forward lineup (line-end-position) 'move)
+              (forward-char -1))
+          (delete-horizontal-space)
+          (indent-to modelica--extra-indent)
+          (if (not (looking-at lineup))
+              (forward-line 1) ; No more indent if there is no : or =
+            (forward-char 1)
+            (delete-horizontal-space)
+            (insert " ")
+            ;; Indent record block
+            (if (looking-at "record\\>")
+                (modelica-indent-declaration (current-column)))
+            (forward-line 1)))))
 
     ;; If arg - move point
     (if arg (forward-line -1)
@@ -903,33 +1170,33 @@ indent of the current line in parameterlist."
 (defun modelica-get-lineup-indent (b e str)
   (save-excursion
     (let ((modelica--extra-indent 0)
-	  (reg (concat str "\\|\\(\\<record\\>\\)\\|" modelica-defun-re)))
+          (reg (concat str "\\|\\(\\<record\\>\\)\\|" modelica-defun-re)))
       (goto-char b)
       ;; Get rightmost position
       (while (< (point) e)
-	(and (re-search-forward reg (min e (point-at-eol 2)) 'move)
-	     (cond ((match-beginning 1)
-		    ;; Skip record blocks
-		    (modelica-declaration-end))
-		   ((match-beginning 2)
-		    ;; We have entered a new procedure.  Exit.
-		    (goto-char e))
-		   (t
-		    (goto-char (match-beginning 0))
-		    (skip-chars-backward " \t")
-		    (if (> (current-column) modelica--extra-indent)
-			(setq modelica--extra-indent (current-column)))
-		    (goto-char (match-end 0))
-		    (end-of-line)
-		    ))))
+        (and (re-search-forward reg (min e (line-end-position 2)) 'move)
+             (cond ((match-beginning 1)
+                    ;; Skip record blocks
+                    (modelica-declaration-end))
+                   ((match-beginning 2)
+                    ;; We have entered a new procedure.  Exit.
+                    (goto-char e))
+                   (t
+                    (goto-char (match-beginning 0))
+                    (skip-chars-backward " \t")
+                    (if (> (current-column) modelica--extra-indent)
+                        (setq modelica--extra-indent (current-column)))
+                    (goto-char (match-end 0))
+                    (end-of-line)
+                    ))))
       ;; In case no lineup was found
       (if (> modelica--extra-indent 0)
-	  (1+ modelica--extra-indent)
-	;; No lineup-string found
-	(goto-char b)
-	(end-of-line)
-	(skip-chars-backward " \t")
-	(1+ (current-column))))))
+          (1+ modelica--extra-indent)
+        ;; No lineup-string found
+        (goto-char b)
+        (end-of-line)
+        (skip-chars-backward " \t")
+        (1+ (current-column))))))
 
 ;;;
 ;;; Completion
@@ -938,12 +1205,12 @@ indent of the current line in parameterlist."
   (catch 'done
     (let ((diff 0))
       (while t
-	(if (or (> (1+ diff) (length str1))
-		(> (1+ diff) (length str2)))
-	    (throw 'done diff))
-	(or (equal (aref str1 diff) (aref str2 diff))
-	    (throw 'done diff))
-	(setq diff (1+ diff))))))
+        (if (or (> (1+ diff) (length str1))
+                (> (1+ diff) (length str2)))
+            (throw 'done diff))
+        (or (equal (aref str1 diff) (aref str2 diff))
+            (throw 'done diff))
+        (setq diff (1+ diff))))))
 
 ;; Calculate all possible completions for functions if argument is `function',
 ;; completions for procedures if argument is `procedure' or both functions and
@@ -968,7 +1235,7 @@ indent of the current line in parameterlist."
 
       ;; Search through all reachable functions
       (while (modelica-beg-of-defun)
-        (if (re-search-forward modelica-str (point-at-eol) t)
+        (if (re-search-forward modelica-str (line-end-position) t)
             (progn (setq match (buffer-substring (match-beginning 2)
                                                  (match-end 2)))
                    (push match modelica-all)))
@@ -980,24 +1247,24 @@ indent of the current line in parameterlist."
   ;; Macro for searching through current declaration (var, type or const)
   ;; for matches of `str' and adding the occurrence to `all'
   (let ((end (save-excursion (modelica-declaration-end)
-			     (point)))
+                             (point)))
         (modelica-all ())
-	match)
+        match)
     ;; Traverse lines
     (while (< (point) end)
-      (if (re-search-forward "[:=]" (point-at-eol) t)
-	  ;; Traverse current line
-	  (while (and (re-search-backward
-		       (concat "\\((\\|\\<\\(var\\|type\\|const\\)\\>\\)\\|"
-			       modelica-symbol-re)
-		       (point-at-bol) t)
-		      (not (match-end 1)))
-	    (setq match (buffer-substring (match-beginning 0) (match-end 0)))
-	    (if (string-match (concat "\\<" modelica-str) match)
+      (if (re-search-forward "[:=]" (line-end-position) t)
+          ;; Traverse current line
+          (while (and (re-search-backward
+                       (concat "\\((\\|\\<\\(var\\|type\\|const\\)\\>\\)\\|"
+                               modelica-symbol-re)
+                       (line-beginning-position) t)
+                      (not (match-end 1)))
+            (setq match (buffer-substring (match-beginning 0) (match-end 0)))
+            (if (string-match (concat "\\<" modelica-str) match)
                 (push match modelica-all))))
-      (if (re-search-forward "\\<record\\>" (point-at-eol) t)
-	  (modelica-declaration-end)
-	(forward-line 1)))
+      (if (re-search-forward "\\<record\\>" (line-end-position) t)
+          (modelica-declaration-end)
+        (forward-line 1)))
 
     modelica-all))
 
@@ -1005,19 +1272,19 @@ indent of the current line in parameterlist."
   "Calculate all possible completions for types."
   (let ((start (point))
         (modelica-all ())
-	goon)
+        goon)
     ;; Search for all reachable type declarations
     (while (or (modelica-beg-of-defun)
-	       (setq goon (not goon)))
+               (setq goon (not goon)))
       (save-excursion
-	(if (and (< start (prog1 (save-excursion (modelica-end-of-defun)
-						 (point))
-			    (forward-char 1)))
-		 (re-search-forward
-		  "\\<type\\>\\|\\<\\(begin\\|function\\)\\>"
-		  start t)
-		 (not (match-end 1)))
-	    ;; Check current type declaration
+        (if (and (< start (prog1 (save-excursion (modelica-end-of-defun)
+                                                 (point))
+                            (forward-char 1)))
+                 (re-search-forward
+                  "\\<type\\>\\|\\<\\(begin\\|function\\)\\>"
+                  start t)
+                 (not (match-end 1)))
+            ;; Check current type declaration
             (setq modelica-all
                   (nconc (modelica-get-completion-decl modelica-str)
                          modelica-all)))))
@@ -1037,7 +1304,7 @@ indent of the current line in parameterlist."
           (if (> start (prog1 (save-excursion (modelica-end-of-defun)
                                               (point))))
               ()                        ; Declarations not reachable
-            (if (search-forward "(" (point-at-eol) t)
+            (if (search-forward "(" (line-end-position) t)
                 ;; Check parameterlist
                 ;; FIXME: modelica-get-completion-decl doesn't understand
                 ;; the var declarations in parameter lists :-(
@@ -1095,7 +1362,7 @@ indent of the current line in parameterlist."
                 (or (eq state 'declaration) (eq state 'paramlist)
                     (and (eq state 'defun)
                          (save-excursion
-                           (re-search-backward ")[ \t]*:" (point-at-bol) t))))
+                           (re-search-backward ")[ \t]*:" (line-beginning-position) t))))
                 (if (or (eq state 'paramlist) (eq state 'defun))
                     (modelica-beg-of-defun))
                 (nconc
@@ -1133,27 +1400,25 @@ indent of the current line in parameterlist."
 
 (defun modelica-completions-at-point ()
   (let* ((b (save-excursion (skip-chars-backward "a-zA-Z0-9_") (point)))
-	 (e (save-excursion (skip-chars-forward "a-zA-Z0-9_") (point))))
+         (e (save-excursion (skip-chars-forward "a-zA-Z0-9_") (point))))
     (when (> e b)
       (list b e #'modelica-completion))))
 
-(define-obsolete-function-alias 'modelica-complete-word
-  'completion-at-point "24.1")
+(defalias 'modelica-complete-word #'completion-at-point)
 
-(define-obsolete-function-alias 'modelica-show-completions
-  'completion-help-at-point "24.1")
+(defalias 'modelica-show-completions #'completion-help-at-point)
 
 
 (defun modelica-get-default-symbol ()
   "Return symbol around current point as a string."
   (save-excursion
     (buffer-substring (progn
-			(skip-chars-backward " \t")
-			(skip-chars-backward "a-zA-Z0-9_")
-			(point))
-		      (progn
-			(skip-chars-forward "a-zA-Z0-9_")
-			(point)))))
+                        (skip-chars-backward " \t")
+                        (skip-chars-backward "a-zA-Z0-9_")
+                        (point))
+                      (progn
+                        (skip-chars-forward "a-zA-Z0-9_")
+                        (point)))))
 
 (defun modelica-build-defun-re (str &optional arg)
   "Return function/procedure starting with STR as regular expression.
@@ -1192,9 +1457,9 @@ With optional second arg non-nil, STR is the complete name of the instruction."
 The default is a name found in the buffer around point."
   (interactive)
   (let* ((default (modelica-get-default-symbol))
-	 (default (if (modelica-comp-defun default nil 'lambda)
-		      default ""))
-	 (label
+         (default (if (modelica-comp-defun default nil 'lambda)
+                      default ""))
+         (label
           ;; Do completion with default.
           (completing-read (if (not (string= default ""))
                                (concat "Label (default " default "): ")
@@ -1208,21 +1473,19 @@ The default is a name found in the buffer around point."
                            nil t "")))
     ;; If there was no response on prompt, use default value.
     (if (string= label "")
-	(setq label default))
+        (setq label default))
     ;; Goto right place in buffer if label is not an empty string.
     (or (string= label "")
-	(progn
-	  (goto-char (point-min))
-	  (re-search-forward (modelica-build-defun-re label t))
-	  (beginning-of-line)))))
+        (progn
+          (goto-char (point-min))
+          (re-search-forward (modelica-build-defun-re label t))
+          (beginning-of-line)))))
 
 ;;;
 ;;; Modelica-outline-mode
 ;;;
 (defvar modelica-outline-map
   (let ((map (make-sparse-keymap)))
-    (if (fboundp 'set-keymap-name)
-        (set-keymap-name modelica-outline-map 'modelica-outline-map))
     (define-key map "\M-\C-a"  'modelica-outline-prev-defun)
     (define-key map "\M-\C-e"  'modelica-outline-next-defun)
     (define-key map "\C-c\C-d" 'modelica-outline-goto-defun)
@@ -1272,12 +1535,12 @@ Modelica Outline mode provides some additional commands.
   (interactive)
   (save-excursion
     (let ((beg (progn (if (not (looking-at "\\(function\\|procedure\\)\\>"))
-			  (modelica-beg-of-defun))
-		      (line-beginning-position)))
-	  (end (progn (modelica-end-of-defun)
-		      (backward-sexp 1)
+                          (modelica-beg-of-defun))
+                      (line-beginning-position)))
+          (end (progn (modelica-end-of-defun)
+                      (backward-sexp 1)
                       (line-beginning-position 2)))
-	  (opoint (point-min)))
+          (opoint (point-min)))
       ;; BEG at BOL.
       ;; OPOINT at EOL.
       ;; END at BOL.
@@ -1286,40 +1549,40 @@ Modelica Outline mode provides some additional commands.
       ;; Hide all functions before current function
       (while (re-search-forward "^[ \t]*\\(function\\|procedure\\)\\>"
                                 beg 'move)
-	(modelica-outline-change opoint (line-end-position 0) t)
-	(setq opoint (line-end-position))
-	;; Functions may be nested
-	(if (> (progn (modelica-end-of-defun) (point)) beg)
-	    (goto-char opoint)))
+        (modelica-outline-change opoint (line-end-position 0) t)
+        (setq opoint (line-end-position))
+        ;; Functions may be nested
+        (if (> (progn (modelica-end-of-defun) (point)) beg)
+            (goto-char opoint)))
       (if (> beg opoint)
-	  (modelica-outline-change opoint (1- beg) t))
+          (modelica-outline-change opoint (1- beg) t))
 
       ;; Show current function
       (modelica-outline-change (1- beg) end nil)
       ;; Hide nested functions
       (forward-char 1)
       (while (re-search-forward "^\\(function\\|class\\package|\\uniontype|record\\block|connector\\)\\>" end 'move)
-	(setq opoint (line-end-position))
-	(modelica-end-of-defun)
-	(modelica-outline-change opoint (line-end-position) t))
+        (setq opoint (line-end-position))
+        (modelica-end-of-defun)
+        (modelica-outline-change opoint (line-end-position) t))
 
       (goto-char end)
       (setq opoint end)
 
       ;; Hide all function after current function
       (while (re-search-forward "^\\(function\\|class\\package|\\uniontype|record\\block|connector\\)\\>" nil 'move)
-	(modelica-outline-change opoint (line-end-position 0) t)
-	(setq opoint (line-end-position))
-	(modelica-end-of-defun))
+        (modelica-outline-change opoint (line-end-position 0) t)
+        (setq opoint (line-end-position))
+        (modelica-end-of-defun))
       (modelica-outline-change opoint (point-max) t)
 
       ;; Hide main program
       (if (< (progn (forward-line -1) (point)) end)
-	  (progn
-	    (goto-char beg)
-	    (modelica-end-of-defun)
-	    (backward-sexp 1)
-	    (modelica-outline-change (line-end-position) (point-max) t))))))
+          (progn
+            (goto-char beg)
+            (modelica-end-of-defun)
+            (backward-sexp 1)
+            (modelica-outline-change (line-end-position) (point-max) t))))))
 
 (defun modelica-outline-next-defun ()
   "Move to next function/procedure, hiding all others."
@@ -1336,17 +1599,34 @@ Modelica Outline mode provides some additional commands.
 (defun modelica-outline-goto-defun ()
   "Move to specified function/procedure, hiding all others."
   (interactive)
-  (modelica-goto-defun)
+  (modelica-goto-class)
   (modelica-hide-other-defuns))
 
- ;; hide/show annotations
-(make-local-variable 'line-move-ignore-invisible)
-(setq line-move-ignore-invisible t)
-(if (functionp 'add-to-invisibility-spec)
-    (add-to-invisibility-spec '(modelica-annotation . t))
-  ;; XEmacs 21.1 does not know function add-to-invisibility-spec
-  (make-local-variable 'buffer-invisibility-spec)
-  (setq buffer-invisibility-spec '((modelica-annotation . t))))
+(defun modelica-check-buffer ()
+  "Parse the current buffer and report the first Modelica parse error.
+On success, report that parsing succeeded.  On failure, move point to
+the reported line and column when the parser message contains one."
+  (interactive)
+  (modelica--ensure-parser-loaded)
+  (if (not (fboundp 'modelica-mode-parse-buffer))
+      (user-error "Modelica parser is unavailable")
+    (condition-case err
+        (progn
+          (modelica-mode-clear-parse-cache)
+          (modelica-mode-parse-buffer)
+          (message "Modelica parse OK")
+          t)
+      (absyn-parse-error
+       (let ((msg (or (cadr err) (format "%S" err))))
+         (when (string-match "\\([0-9]+\\):\\([0-9]+\\)" msg)
+           (goto-char (point-min))
+           (forward-line (1- (string-to-number (match-string 1 msg))))
+           (move-to-column (1- (string-to-number (match-string 2 msg)))))
+         (message "Modelica parse error: %s" msg)
+         nil)))))
+
+;; hide/show annotations
+(add-to-invisibility-spec '(modelica-annotation . t))
 
 
 (defun modelica-hide-annotations (beg end)
@@ -1355,13 +1635,13 @@ Modelica Outline mode provides some additional commands.
     (let (beg-hide end-hide)
       (goto-char beg)
       (while
-	  (and (< (point) end)
-	       (search-forward-regexp "\\<annotation[ \t\n]*\(" end t))
-	(setq beg-hide (match-end 0))
-	(backward-char)
-	(forward-sexp)
-	(setq end-hide (- (point) 1))
-	(modelica-flag-region beg-hide end-hide t)))))
+          (and (< (point) end)
+               (re-search-forward "\\<annotation[ \t\n]*\(" end t))
+        (setq beg-hide (match-end 0))
+        (backward-char)
+        (forward-sexp)
+        (setq end-hide (- (point) 1))
+        (modelica-flag-region beg-hide end-hide t)))))
 
 (defun modelica-show-annotations (beg end)
   "Show annotations from beg to end"
@@ -1410,12 +1690,12 @@ Modelica Outline mode provides some additional commands.
       (setq beg (prog1 end (setq end beg))))
   (save-excursion
     (let ((overlays (overlays-in beg end))
-	  o)
+          o)
       (while overlays
-	(setq o (car overlays))
- 	(if (eq (overlay-get o 'invisible) value)
-	    (delete-overlay o))
-	(setq overlays (cdr overlays))))))
+        (setq o (car overlays))
+        (if (eq (overlay-get o 'invisible) value)
+            (delete-overlay o))
+        (setq overlays (cdr overlays))))))
 
 (defun modelica-flag-region (from to flag)
   "Hides or shows lines from FROM to TO, according to FLAG.
@@ -1424,32 +1704,32 @@ If FLAG is nil then text is shown, while if FLAG is t the text is hidden."
     (goto-char from)
     (modelica-discard-overlays from to 'modelica-annotation)
     (if flag
-	(let ((o (make-overlay from to)))
-	  (overlay-put o 'invisible 'modelica-annotation)
-	  (overlay-put o 'isearch-open-invisible
-		       'modelica-isearch-open-invisible)))))
+        (let ((o (make-overlay from to)))
+          (overlay-put o 'invisible 'modelica-annotation)
+          (overlay-put o 'isearch-open-invisible
+                       'modelica-isearch-open-invisible)))))
 
 
-  (defvar modelica-mode-map nil
+  (defvar modelica-mode-map
+    (let ((map (make-sparse-keymap)))
+      (define-key map "\C-j"   'modelica-newline-and-indent)
+      (define-key map "\C-c\C-e" 'modelica-insert-end)
+      (define-key map "\C-c\C-p" 'modelica-check-buffer)
+      (define-key map "\C-c\C-s" 'modelica-show-annotation)
+      (define-key map "\C-c\C-h" 'modelica-hide-annotation)
+      (define-key map "\es"   'modelica-show-all-annotations)
+      (define-key map "\eh"   'modelica-hide-all-annotations)
+      (define-key map "\C-c\C-c" 'comment-region)
+      (define-key map "\e;"   'modelica-indent-for-comment)
+      (define-key map "\ej"   'modelica-indent-new-comment-line)
+      (define-key map "\ef"   'modelica-forward-statement)
+      (define-key map "\eb"   'modelica-backward-statement)
+      (define-key map "\en"   'modelica-forward-block)
+      (define-key map "\ep"   'modelica-backward-block)
+      (define-key map "\ea"   'modelica-to-block-begin)
+      (define-key map "\ee"   'modelica-to-block-end)
+      map)
     "Keymap for Modelica mode.")
-
-  (if modelica-mode-map ()
-    (setq modelica-mode-map (make-sparse-keymap))
-    (define-key modelica-mode-map "\C-j"	'modelica-newline-and-indent)
-    (define-key modelica-mode-map "\C-c\C-e"	'modelica-insert-end)
-    (define-key modelica-mode-map "\C-c\C-s"	'modelica-show-annotation)
-    (define-key modelica-mode-map "\C-c\C-h"	'modelica-hide-annotation)
-    (define-key modelica-mode-map "\es"	        'modelica-show-all-annotations)
-    (define-key modelica-mode-map "\eh"	        'modelica-hide-all-annotations)
-    (define-key modelica-mode-map "\C-c\C-c"	'comment-region)
-    (define-key modelica-mode-map "\e;"         'modelica-indent-for-comment)
-    (define-key modelica-mode-map "\ej"         'modelica-indent-new-comment-line)
-    (define-key modelica-mode-map "\ef"         'modelica-forward-statement)
-    (define-key modelica-mode-map "\eb"         'modelica-backward-statement)
-    (define-key modelica-mode-map "\en"         'modelica-forward-block)
-    (define-key modelica-mode-map "\ep"         'modelica-backward-block)
-    (define-key modelica-mode-map "\ea"         'modelica-to-block-begin)
-    (define-key modelica-mode-map "\ee"         'modelica-to-block-end))
 
 
 

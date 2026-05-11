@@ -34,6 +34,14 @@ and add the following lines to your file ~/.emacs
 (autoload 'mdc-browse "mdc-browse" "Modelica Class Browsing" t)
 (autoload 'br-mdc "br-mdc" "Modelica Class Browsing" t)
 
+;; Enable native .eln compilation for this package
+(setq modelica-enable-native-compilation t)
+;; Optional: recompile parser/mode files after saving package sources
+;; (setq modelica-native-compile-on-save t)
+
+;; Optional manual command:
+;; M-x modelica-native-compile
+
 (defvar br-env-lang-avector
   '[
     ("C++/C"   . "c++-")

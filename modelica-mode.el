@@ -28,26 +28,339 @@
 ;; For indention reuses many procedures for Pascal-mode provided by Espen Skoglund
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(require 'cl-lib)
+(require 'subr-x)
+
 (defun modelica--package-directory ()
   "Return the directory containing modelica-mode sources."
   (or (and load-file-name (file-name-directory load-file-name))
       (and buffer-file-name (file-name-directory buffer-file-name))
       default-directory))
 
+(let ((dir (modelica--package-directory)))
+  (when (and dir (file-directory-p dir))
+    (add-to-list 'load-path dir)))
+
+(require 'absyn-parser)
+
+(declare-function absyn-element-spec "absyn-ast" (cl-x))
+
 (defun modelica--ensure-parser-loaded ()
-  "Load the parser integration for modelica-mode."
-  (or (featurep 'modelica-mode_)
-      (let ((dir (modelica--package-directory)))
-        (when (and dir (file-directory-p dir))
-          (add-to-list 'load-path dir))
-        (require 'modelica-mode_ nil t))))
+  "Return non-nil when the integrated Modelica parser is available."
+  (and (featurep 'absyn-parser)
+       (fboundp 'absyn-parse-string)))
 
-(condition-case nil
-    (modelica--ensure-parser-loaded)
-  (error nil))
+;;; Parser integration
 
-(declare-function modelica-mode-clear-parse-cache "modelica-mode_" (&optional buffer))
-(declare-function modelica-mode-parse-buffer "modelica-mode_" (&optional buffer))
+(defvar-local modelica-mode--ast-cache nil
+  "Cached Absyn AST for current buffer.")
+
+(defvar-local modelica-mode--ast-cache-tick -1
+  "`buffer-chars-modified-tick' value when `modelica-mode--ast-cache' was created.")
+
+(defun modelica-mode-parse-file (file)
+  "Parse FILE into an Absyn PROGRAM record.
+
+Returns the parser AST produced by `absyn-parse-file' and signals
+`absyn-parse-error' on syntax errors."
+  (absyn-parse-file file))
+
+(defun modelica-mode-parse-string (text &optional file)
+  "Parse TEXT into an Absyn PROGRAM record.
+
+FILE is forwarded to the underlying parser for source-info metadata."
+  (absyn-parse-string text file))
+
+(defun modelica-mode-tokenize-string (text &optional file)
+  "Tokenize TEXT with the Absyn lexer.
+
+Useful for debugging parser input.
+
+FILE is forwarded to the lexer metadata for source-info columns/lines."
+  (absyn-tokenize-string text file))
+
+(defun modelica-mode-parse-buffer (&optional buffer)
+  "Parse BUFFER (default current buffer) into an Absyn PROGRAM.
+
+Result is cached per-buffer and invalidated when the buffer is
+modified."
+  (with-current-buffer (or buffer (current-buffer))
+    (let ((tick (buffer-chars-modified-tick))
+          (source (buffer-substring-no-properties (point-min) (point-max)))
+          (file (or (buffer-file-name) "<buffer>")))
+      (if (and modelica-mode--ast-cache
+               (= modelica-mode--ast-cache-tick tick))
+          modelica-mode--ast-cache
+        (setq modelica-mode--ast-cache-tick tick)
+        (setq modelica-mode--ast-cache
+              (condition-case err
+                  (modelica-mode-parse-string source file)
+                (absyn-parse-error
+                 ;; Parsing can fail on incomplete or invalid buffers; clear cache
+                 ;; and re-signal the condition for callers that want details.
+                 (setq modelica-mode--ast-cache nil)
+                 (setq modelica-mode--ast-cache-tick -1)
+                 (signal (car err) (cdr err)))))))))
+
+(defun modelica-mode-clear-parse-cache (&optional buffer)
+  "Clear cached parser state for BUFFER (default current buffer)."
+  (with-current-buffer (or buffer (current-buffer))
+    (setq modelica-mode--ast-cache nil)
+    (setq modelica-mode--ast-cache-tick -1)))
+
+(defun modelica-mode-parser-available-p ()
+  "Return non-nil if the Absyn parser backend is available."
+  (modelica--ensure-parser-loaded))
+
+(defun modelica-mode--line-col-from-pos (pos)
+  (list (line-number-at-pos pos)
+        (save-excursion
+          (goto-char pos)
+          (1+ (current-column)))))
+
+(defun modelica-mode--inside-source-info-p (info line col)
+  (let ((start-line (absyn-source-info-start-line info))
+        (start-col (absyn-source-info-start-column info))
+        (end-line (absyn-source-info-end-line info))
+        (end-col (absyn-source-info-end-column info)))
+    (and (or (< start-line line)
+             (and (= start-line line) (>= col start-col)))
+         (or (> end-line line)
+             (and (= end-line line) (<= col end-col))))))
+
+(defun modelica-mode--node-info (node)
+  (cond
+   ((absyn-class-p node)
+    (absyn-class-info node))
+   ((absyn-elementitem-p node)
+    (modelica-mode--node-info (absyn-elementitem-element node)))
+   ((absyn-element-p node)
+    (absyn-element-info node))
+   ((absyn-equationitem-p node)
+    (absyn-equationitem-info node))
+   ((absyn-algorithmitem-p node)
+    (absyn-algorithmitem-info node))
+   ((absyn-defineunit-p node)
+    (absyn-defineunit-info node))
+   (t nil)))
+
+(defun modelica-mode--in-node-p (node line col)
+  (let ((info (modelica-mode--node-info node)))
+    (and info (modelica-mode--inside-source-info-p info line col))))
+
+(defun modelica-mode--part-contents (part)
+  (cond
+   ((absyn-public-p part) (absyn-public-contents part))
+   ((absyn-protected-p part) (absyn-protected-contents part))
+   ((absyn-equations-p part) (absyn-equations-contents part))
+   ((absyn-initialequations-p part) (absyn-initialequations-contents part))
+   ((absyn-algorithms-p part) (absyn-algorithms-contents part))
+   ((absyn-initialalgorithms-p part) (absyn-initialalgorithms-contents part))
+   ((absyn-constraints-p part) (absyn-constraints-contents part))
+   (t nil)))
+
+(defun modelica-mode--part-kind (part)
+  (cond
+   ((absyn-public-p part) :declaration)
+   ((absyn-protected-p part) :declaration)
+   ((absyn-equations-p part) :block)
+   ((absyn-initialequations-p part) :block)
+   ((absyn-algorithms-p part) :block)
+   ((absyn-initialalgorithms-p part) :block)
+   ((absyn-constraints-p part) :declaration)
+   (t :unknown)))
+
+(defun modelica-mode--node-in-list-p (items line col)
+  (cl-some (lambda (item)
+             (and (modelica-mode--in-node-p item line col) item))
+           items))
+
+(defun modelica-mode--equation-item-context (items line col)
+  (let ((item (modelica-mode--node-in-list-p items line col)))
+    (and item 'block)))
+
+(defun modelica-mode--algorithm-item-context (items line col)
+  (let ((item (modelica-mode--node-in-list-p items line col)))
+    (and item 'block)))
+
+(defun modelica-mode--element-context (item line col)
+  (let* ((el (and (absyn-elementitem-p item)
+                  (absyn-elementitem-element item))))
+    (cond
+     ((not el) 'declaration)
+     ((absyn-element-spec el)
+      (let ((spec (absyn-element-spec el)))
+        (cond
+         ((absyn-classdef-p spec)
+          (let ((ctx (modelica-mode--class-context (absyn-classdef-class spec) line col)))
+            (or ctx 'declaration)))
+         (t 'declaration))))
+     (t 'declaration))))
+
+(defun modelica-mode--declaration-context (items line col)
+  (let ((item (modelica-mode--node-in-list-p items line col)))
+    (and item (modelica-mode--element-context item line col))))
+
+(defun modelica-mode--parts-context (parts line col)
+  (cl-block done
+    (dolist (part parts)
+      (let* ((kind (modelica-mode--part-kind part))
+             (contents (modelica-mode--part-contents part)))
+        (let ((ctx (cond
+                    ((eq kind :declaration)
+                     (modelica-mode--declaration-context contents line col))
+                    ((eq kind :block)
+                     (or (modelica-mode--equation-item-context contents line col)
+                         (modelica-mode--algorithm-item-context contents line col)))
+                    (t nil))))
+          (when ctx
+            (cl-return-from done ctx)))))
+    nil))
+
+(defun modelica-mode--parts-of-body (body)
+  (cond
+   ((absyn-parts-p body) (absyn-parts-class-parts body))
+   ((absyn-class-extends-p body) (absyn-class-extends-parts body))
+   (t nil)))
+
+(defun modelica-mode--class-context (class line col)
+  (when (and (absyn-class-p class) (modelica-mode--in-node-p class line col))
+    (let ((body (absyn-class-body class)))
+      (if body
+          (or (modelica-mode--parts-context (modelica-mode--parts-of-body body) line col)
+              (if (absyn-parts-p body)
+                  'block
+                'declaration))
+        'declaration))))
+
+(defun modelica-mode--program-context (program line col)
+  (when (absyn-program-p program)
+    (cl-loop for class in (absyn-program-classes program)
+             for ctx = (modelica-mode--class-context class line col)
+             if ctx return ctx)))
+
+(defun modelica-mode--line-context-type (point)
+  "Return declaration/block context for POINT from parser-validated text."
+  (save-excursion
+    (goto-char point)
+    (let ((target (line-beginning-position))
+          (ctx nil))
+      (goto-char (point-min))
+      (while (<= (line-beginning-position) target)
+        (let* ((line (modelica-mode--indent-line-text))
+               (kind (modelica-mode--indent-line-kind line)))
+          (unless (or (string-empty-p line)
+                      (string-prefix-p "//" line))
+            (pcase kind
+              ('class (setq ctx 'declaration))
+              ('section (setq ctx 'block)))))
+        (if (= (line-beginning-position) target)
+            (goto-char (point-max))
+          (forward-line 1)))
+      ctx)))
+
+(defun modelica-mode-parser-indent-type (&optional point)
+  "Return a parser-derived indent type for POINT.
+
+Returns one of `declaration', `block' or `defun'.
+Fallback `nil' when no stable AST context is available."
+  (let ((point (or point (point))))
+    (condition-case nil
+        (let* ((loc (modelica-mode--line-col-from-pos point))
+               (line (car loc))
+               (col (cadr loc))
+               (ast (modelica-mode-parse-buffer))
+               (ctx (or (modelica-mode--line-context-type point)
+                        (modelica-mode--program-context ast line col))))
+          (when (memq ctx '(declaration block defun)) ctx))
+      (absyn-parse-error nil)
+      (error nil))))
+
+(defun modelica-mode--indent-line-text ()
+  "Return current line text without leading or trailing whitespace."
+  (string-trim
+   (buffer-substring-no-properties (line-beginning-position)
+                                   (line-end-position))))
+
+(defun modelica-mode--indent-line-kind (line)
+  "Return structural indentation kind for LINE."
+  (cond
+   ((string-match-p "\\`\\(model\\|class\\|package\\|function\\|block\\|connector\\|record\\|uniontype\\)\\b" line)
+    'class)
+   ((string-match-p "\\`\\(equation\\|algorithm\\|initial[ \t]+equation\\|initial[ \t]+algorithm\\)\\b" line)
+    'section)
+   ((string-match-p "\\`\\(if\\|for\\|while\\|when\\)\\b.*\\b\\(then\\|loop\\)\\b" line)
+    'control)
+   ((string-match-p "\\`end\\b" line)
+    'end)
+   ((string-match-p "\\bmatch\\(continue\\)?\\b" line)
+    'match)
+   ((string-match-p "\\`case\\b" line)
+    'case)
+   ((string-match-p "\\`else\\(if\\)?\\b" line)
+    'else)
+   (t 'statement)))
+
+(defun modelica-mode--indent-top-kind (stack)
+  (caar stack))
+
+(defun modelica-mode--indent-top-base (stack)
+  (cdar stack))
+
+(defun modelica-mode--structural-indent-column (indent-level)
+  "Return structural indentation column using INDENT-LEVEL."
+  (save-excursion
+    (let ((target (line-beginning-position))
+          (indent 0)
+          stack)
+      (goto-char (point-min))
+      (while (< (line-beginning-position) target)
+        (let* ((line (modelica-mode--indent-line-text))
+               (kind (modelica-mode--indent-line-kind line)))
+          (unless (or (string-empty-p line)
+                      (string-prefix-p "//" line))
+            (pcase kind
+              ('class
+               (push (cons 'class indent) stack)
+               (setq indent (+ indent indent-level)))
+              ('section
+               (setq indent (+ (or (modelica-mode--indent-top-base stack) 0)
+                               indent-level)))
+              ('control
+               (push (cons 'control indent) stack)
+               (setq indent (+ indent indent-level)))
+              ('match
+               (push (cons 'match indent) stack)
+               (setq indent (+ indent indent-level)))
+              ('end
+               (when stack
+                 (setq indent (modelica-mode--indent-top-base stack))
+                 (pop stack))))))
+        (forward-line 1))
+      (let* ((line (modelica-mode--indent-line-text))
+             (kind (modelica-mode--indent-line-kind line)))
+        (pcase kind
+          ('section (or (modelica-mode--indent-top-base stack) 0))
+          ('end (if stack (modelica-mode--indent-top-base stack) 0))
+          ('else (if (eq (modelica-mode--indent-top-kind stack) 'match)
+                     indent
+                   (max 0 (- indent indent-level))))
+          (_ indent))))))
+
+(defun modelica-mode-parser-indent-column (&optional point indent-level)
+  "Return parser-derived indentation column for POINT.
+
+Return nil when the current buffer cannot be parsed."
+  (let ((point (or point (point)))
+        (indent-level (or indent-level 2)))
+    (condition-case nil
+        (progn
+          (modelica-mode-parse-buffer)
+          (save-excursion
+            (goto-char point)
+            (modelica-mode--structural-indent-column indent-level)))
+      (absyn-parse-error nil)
+      (error nil))))
 
 (defconst modelica-mode-version "2.0.0")
 
@@ -59,7 +372,6 @@
 ;;; Native compilation support (.eln)
 (defconst modelica--native-compilation-sources
   '("modelica-mode.el"
-    "modelica-mode_.el"
     "absyn-parser.el"
     "absyn-ast.el")
   "Modelica-mode source files compiled for native `.eln' generation.")
@@ -828,78 +1140,11 @@ This puts the mark at the end, and point at the beginning."
     (defun . modelica--extra-indent) (contexp . modelica--extra-indent)
     (unknown . modelica--extra-indent) (string . 0) (progbeg . 0)))
 
-(defun modelica--indent-line-text ()
-  "Return current line text without leading or trailing whitespace."
-  (string-trim
-   (buffer-substring-no-properties (line-beginning-position)
-                                   (line-end-position))))
-
-(defun modelica--indent-line-kind (line)
-  "Return the syntactic indentation kind for LINE."
-  (cond
-   ((string-match-p "\\`\\(model\\|class\\|package\\|function\\|block\\|connector\\|record\\|uniontype\\)\\b" line)
-    'class)
-   ((string-match-p "\\`\\(equation\\|algorithm\\|initial[ \t]+equation\\|initial[ \t]+algorithm\\)\\b" line)
-    'section)
-   ((string-match-p "\\`\\(if\\|for\\|while\\|when\\)\\b.*\\b\\(then\\|loop\\)\\b" line)
-    'control)
-   ((string-match-p "\\`end\\b" line)
-    'end)
-   ((string-match-p "\\bmatch\\(continue\\)?\\b" line)
-    'match)
-   ((string-match-p "\\`case\\b" line)
-    'case)
-   ((string-match-p "\\`else\\(if\\)?\\b" line)
-    'else)
-   (t 'statement)))
-
-(defun modelica--indent-top-kind (stack)
-  (caar stack))
-
-(defun modelica--indent-top-base (stack)
-  (cdar stack))
-
 (defun modelica--indent-compute-column ()
   "Return parser-style indentation column for the current line."
   (or (and (fboundp 'modelica-mode-parser-indent-column)
            (modelica-mode-parser-indent-column (point) modelica-indent-level))
-      (save-excursion
-        (let ((target (line-beginning-position))
-              (indent 0)
-              stack)
-          (goto-char (point-min))
-          (while (< (line-beginning-position) target)
-            (let* ((line (modelica--indent-line-text))
-                   (kind (modelica--indent-line-kind line)))
-              (unless (or (string-empty-p line)
-                          (string-prefix-p "//" line))
-                (pcase kind
-                  ('class
-                   (push (cons 'class indent) stack)
-                   (setq indent (+ indent modelica-indent-level)))
-                  ('section
-                   (setq indent (+ (or (modelica--indent-top-base stack) 0)
-                                   modelica-indent-level)))
-                  ('control
-                   (push (cons 'control indent) stack)
-                   (setq indent (+ indent modelica-indent-level)))
-                  ('match
-                   (push (cons 'match indent) stack)
-                   (setq indent (+ indent modelica-indent-level)))
-                  ('end
-                   (when stack
-                     (setq indent (modelica--indent-top-base stack))
-                     (pop stack))))))
-            (forward-line 1))
-          (let* ((line (modelica--indent-line-text))
-                 (kind (modelica--indent-line-kind line)))
-            (pcase kind
-              ('section (or (modelica--indent-top-base stack) 0))
-              ('end (if stack (modelica--indent-top-base stack) 0))
-              ('else (if (eq (modelica--indent-top-kind stack) 'match)
-                         indent
-                       (max 0 (- indent modelica-indent-level))))
-              (_ indent)))))))
+      (modelica-mode--structural-indent-column modelica-indent-level)))
 
 (defun modelica-indent-command ()
   "Indent for special part of code."

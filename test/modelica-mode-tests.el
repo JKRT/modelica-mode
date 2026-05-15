@@ -22,8 +22,7 @@
                      default-directory))
        (project-root (file-name-directory (directory-file-name file-dir))))
   (add-to-list 'load-path project-root)
-  (load (expand-file-name "modelica-mode.el" project-root) nil t)
-  (load (expand-file-name "modelica-mode_.el" project-root) nil t))
+  (load (expand-file-name "modelica-mode.el" project-root) nil t))
 
 (defmacro modelica-mode-test--with-buffer (code &rest body)
   `(with-temp-buffer
